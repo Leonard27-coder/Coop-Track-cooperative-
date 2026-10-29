@@ -1,603 +1,429 @@
+﻿// CoopTrack frontend - dashboard and cooperative records
 "use strict";
 
-// CoopTrack frontend.
-// All records are loaded from and saved to the Java API and SQLite database.
-
+const $ = (id) => document.getElementById(id);
 const members = [];
 const tasks = [];
 const contributions = [];
 const supportRecords = [];
 const invitations = [];
 
-let nextId = 1;
-
-// -------------------- GENERAL HELPERS --------------------
-
-function escapeHtml(value) {
-  return String(value ?? "").replace(/[&<>"']/g, (character) => {
-    const entities = {
-      "&": "&amp;",
-      "<": "&lt;",
-      ">": "&gt;",
-      '"': "&quot;",
-      "'": "&#039;",
-    };
-
-    return entities[character];
+async function api(url, options = {}) {
+  const response = await fetch(url, {
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...(options.headers || {}),
+    },
   });
-}
 
-function showMessage(message) {
-  alert(message);
-}
-
-function getElement(id) {
-  return document.getElementById(id);
-}
-
-async function readApiResponse(response) {
   const text = await response.text();
-  let result = {};
-
+  let data = {};
   if (text) {
     try {
-      result = JSON.parse(text);
+      data = JSON.parse(text);
     } catch {
-      result = { error: text };
+      data = { message: text };
     }
   }
 
   if (!response.ok) {
-    throw new Error(
-      result.error || result.message || `Server returned ${response.status}`,
-    );
+    throw new Error(data.error || data.message || `HTTP ${response.status}`);
   }
-
-  return result;
+  return data;
 }
 
-// -------------------- MEMBERS --------------------
+function safe(value) {
+  return String(value ?? "").replace(
+    /[&<>"']/g,
+    (ch) =>
+      ({
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        '"': "&quot;",
+        "'": "&#039;",
+      })[ch],
+  );
+}
 
-function renderMembers() {
-  const list = getElement("member-list");
+function notify(message) {
+  alert(message);
+}
 
-  if (list) {
-    list.innerHTML = members.length
-      ? members
-          .map(
-            (member) => `
-              <tr>
-                <td>${escapeHtml(member.id)}</td>
-                <td>${escapeHtml(member.name)}</td>
-                <td>${escapeHtml(member.email)}</td>
-                <td>${escapeHtml(member.phone)}</td>
-                <td>${escapeHtml(member.status)}</td>
-              </tr>
-            `,
-          )
-          .join("")
-      : '<tr><td colspan="5" class="empty">No members registered yet.</td></tr>';
+function setCount(id, value) {
+  const element = $(id);
+  if (element) element.textContent = value;
+}
+
+function showSection(name) {
+  document.querySelectorAll(".page-section").forEach((section) => {
+    section.style.display = section.id === name ? "" : "none";
+  });
+
+  document.querySelectorAll(".nav-link").forEach((link) => {
+    link.classList.toggle("active", link.getAttribute("href") === `#${name}`);
+  });
+
+  const titles = {
+    dashboard: "Dashboard",
+    members: "Members",
+    tasks: "Tasks & Work Days",
+    contributions: "Contributions",
+    support: "Member Support",
+    invitations: "Invitation Keys",
+  };
+
+  if ($("page-title"))
+    $("page-title").textContent = titles[name] || "Dashboard";
+}
+
+function navigate() {
+  const name = location.hash.replace("#", "") || "dashboard";
+  showSection(name);
+  loadSectionData(name);
+}
+
+async function loadDashboard() {
+  try {
+    const [m, t, c, s] = await Promise.all([
+      api("/api/members"),
+      api("/api/tasks"),
+      api("/api/contributions"),
+      api("/api/support"),
+    ]);
+
+    setCount("member-count", m.length);
+    setCount("task-count", t.length);
+    setCount(
+      "pending-count",
+      t.filter(
+        (task) =>
+          !["completed", "complete", "done"].includes(
+            String(task.progress || task.status || "").toLowerCase(),
+          ),
+      ).length,
+    );
+    setCount("record-count", c.length);
+    setCount("support-count", s.length);
+  } catch (error) {
+    console.error("Dashboard loading failed:", error);
   }
+}
 
-  // Update member dropdowns if they exist.
-  document.querySelectorAll(".member-select").forEach((select) => {
-    const selectedValue = select.value;
+function updateMemberDropdowns() {
+  ["task-assignee", "record-member", "support-member"].forEach((id) => {
+    const select = $(id);
+    if (!select) return;
 
+    const previous = select.value;
     select.innerHTML =
       '<option value="">Select a member</option>' +
       members
         .map(
-          (member) => `
-            <option value="${escapeHtml(member.id)}">
-              ${escapeHtml(member.name)}
-            </option>
-          `,
+          (member) =>
+            `<option value="${safe(member.id)}">${safe(member.name)}</option>`,
         )
         .join("");
 
-    if (members.some((member) => String(member.id) === selectedValue)) {
-      select.value = selectedValue;
+    if (members.some((member) => String(member.id) === previous)) {
+      select.value = previous;
     }
   });
 }
 
 async function loadMembers() {
   try {
-    const response = await fetch("/api/members");
-    const data = await readApiResponse(response);
-
-    if (!Array.isArray(data)) {
-      throw new Error("The members API did not return a list.");
-    }
+    const data = await api("/api/members");
+    if (!Array.isArray(data)) throw new Error("Unexpected members response");
 
     members.splice(0, members.length, ...data);
-    renderMembers();
-  } catch (error) {
-    console.error("Could not load members:", error);
-    showMessage(`Could not load members: ${error.message}`);
-  }
-}
+    const list = $("member-list");
 
-const memberForm = getElement("member-form");
-
-if (memberForm) {
-  memberForm.addEventListener("submit", async (event) => {
-    event.preventDefault();
-
-    const submitButton = memberForm.querySelector(
-      'button[type="submit"], input[type="submit"]',
-    );
-
-    if (submitButton) submitButton.disabled = true;
-
-    try {
-      const formData = new FormData(memberForm);
-
-      const member = {
-        name: String(formData.get("name") || "").trim(),
-        email: String(formData.get("email") || "").trim(),
-        phone: String(formData.get("phone") || "").trim(),
-      };
-
-      const response = await fetch("/api/members", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(member),
-      });
-
-      const result = await readApiResponse(response);
-
-      await loadMembers();
-      memberForm.reset();
-
-      showMessage(result.message || "Member saved successfully.");
-    } catch (error) {
-      console.error("Could not save member:", error);
-      showMessage(`Could not save member: ${error.message}`);
-    } finally {
-      if (submitButton) submitButton.disabled = false;
+    if (list) {
+      list.innerHTML = members.length
+        ? members
+            .map(
+              (member) => `
+          <tr>
+            <td>${safe(member.name)}</td>
+            <td>${safe(member.email)}</td>
+          </tr>`,
+            )
+            .join("")
+        : '<tr><td colspan="2" class="empty">No members added yet.</td></tr>';
     }
-  });
-}
 
-// -------------------- TASKS --------------------
-
-function renderTasks() {
-  const list = getElement("task-list");
-
-  if (list) {
-    list.innerHTML = tasks.length
-      ? tasks
-          .map(
-            (task) => `
-              <tr>
-                <td>${escapeHtml(task.id)}</td>
-                <td>${escapeHtml(task.title)}</td>
-                <td>${escapeHtml(task.description)}</td>
-                <td>${escapeHtml(task.status)}</td>
-                <td>
-                  <button
-                    type="button"
-                    class="task-status-button"
-                    data-task-id="${escapeHtml(task.id)}"
-                  >
-                    Update status
-                  </button>
-                </td>
-              </tr>
-            `,
-          )
-          .join("")
-      : '<tr><td colspan="5" class="empty">No tasks recorded yet.</td></tr>';
+    updateMemberDropdowns();
+    setCount("member-count", members.length);
+  } catch (error) {
+    console.error("Loading members failed:", error);
   }
 }
 
 async function loadTasks() {
   try {
-    const response = await fetch("/api/tasks");
-    const data = await readApiResponse(response);
-
-    if (!Array.isArray(data)) {
-      throw new Error("The tasks API did not return a list.");
-    }
+    const data = await api("/api/tasks");
+    if (!Array.isArray(data)) throw new Error("Unexpected tasks response");
 
     tasks.splice(0, tasks.length, ...data);
-    renderTasks();
-  } catch (error) {
-    console.error("Could not load tasks:", error);
-    showMessage(`Could not load tasks: ${error.message}`);
-  }
-}
+    const list = $("task-list");
 
-const taskForm = getElement("task-form");
-
-if (taskForm) {
-  taskForm.addEventListener("submit", async (event) => {
-    event.preventDefault();
-
-    const submitButton = taskForm.querySelector(
-      'button[type="submit"], input[type="submit"]',
-    );
-
-    if (submitButton) submitButton.disabled = true;
-
-    try {
-      const formData = new FormData(taskForm);
-
-      const task = {
-        title: String(formData.get("title") || "").trim(),
-        description: String(formData.get("description") || "").trim(),
-      };
-
-      const response = await fetch("/api/tasks", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(task),
-      });
-
-      const result = await readApiResponse(response);
-
-      await loadTasks();
-      taskForm.reset();
-
-      showMessage(result.message || "Task saved successfully.");
-    } catch (error) {
-      console.error("Could not save task:", error);
-      showMessage(`Could not save task: ${error.message}`);
-    } finally {
-      if (submitButton) submitButton.disabled = false;
+    if (list) {
+      list.innerHTML = tasks.length
+        ? tasks
+            .map(
+              (task) => `
+          <tr>
+            <td>${safe(task.title)}</td>
+            <td>${safe(task.assignee || task.member || task.memberName || "")}</td>
+            <td>${safe(task.deadline || "")}</td>
+            <td>${safe(task.workDays ?? "")}</td>
+            <td>${safe(task.progress || task.status || "Pending")}</td>
+          </tr>`,
+            )
+            .join("")
+        : '<tr><td colspan="5" class="empty">No tasks created yet.</td></tr>';
     }
-  });
-}
 
-document.addEventListener("click", async (event) => {
-  const button = event.target.closest(".task-status-button");
-
-  if (!button) return;
-
-  const taskId = button.dataset.taskId;
-  const task = tasks.find((item) => String(item.id) === String(taskId));
-
-  if (!task) return;
-
-  const statuses = ["Pending", "In Progress", "Completed"];
-  const currentIndex = statuses.indexOf(task.status);
-  const nextStatus = statuses[(currentIndex + 1) % statuses.length];
-
-  button.disabled = true;
-
-  try {
-    const response = await fetch(`/api/tasks/${encodeURIComponent(taskId)}`, {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ status: nextStatus }),
-    });
-
-    await readApiResponse(response);
-    await loadTasks();
+    setCount("task-count", tasks.length);
+    setCount(
+      "pending-count",
+      tasks.filter(
+        (task) =>
+          !["completed", "complete", "done"].includes(
+            String(task.progress || task.status || "").toLowerCase(),
+          ),
+      ).length,
+    );
   } catch (error) {
-    console.error("Could not update task:", error);
-    showMessage(`Could not update task: ${error.message}`);
-  } finally {
-    button.disabled = false;
-  }
-});
-
-// -------------------- CONTRIBUTIONS --------------------
-
-function renderContributions() {
-  const list = getElement("contribution-list");
-
-  if (list) {
-    list.innerHTML = contributions.length
-      ? contributions
-          .map(
-            (contribution) => `
-              <tr>
-                <td>${escapeHtml(contribution.id)}</td>
-                <td>${escapeHtml(contribution.memberName || contribution.memberId)}</td>
-                <td>${escapeHtml(contribution.amount)}</td>
-                <td>${escapeHtml(contribution.date || contribution.createdAt || "")}</td>
-              </tr>
-            `,
-          )
-          .join("")
-      : '<tr><td colspan="4" class="empty">No contributions recorded yet.</td></tr>';
+    console.error("Loading tasks failed:", error);
   }
 }
 
 async function loadContributions() {
   try {
-    const response = await fetch("/api/contributions");
-    const data = await readApiResponse(response);
-
-    if (!Array.isArray(data)) {
-      throw new Error("The contributions API did not return a list.");
-    }
+    const data = await api("/api/contributions");
+    if (!Array.isArray(data))
+      throw new Error("Unexpected contributions response");
 
     contributions.splice(0, contributions.length, ...data);
-    renderContributions();
+    const list = $("record-list");
+
+    if (list) {
+      list.innerHTML = contributions.length
+        ? contributions
+            .map(
+              (item) => `
+          <tr>
+            <td>${safe(item.type || "")}</td>
+            <td>${safe(item.member || item.memberName || item.memberId || "")}</td>
+            <td>${safe(item.description || "")}</td>
+            <td>${safe(item.amount ?? "")}</td>
+          </tr>`,
+            )
+            .join("")
+        : '<tr><td colspan="4" class="empty">No contributions recorded yet.</td></tr>';
+    }
+
+    setCount("record-count", contributions.length);
   } catch (error) {
-    console.error("Could not load contributions:", error);
-    showMessage(`Could not load contributions: ${error.message}`);
+    console.error("Loading contributions failed:", error);
   }
 }
 
-const contributionForm = getElement("contribution-form");
-
-if (contributionForm) {
-  contributionForm.addEventListener("submit", async (event) => {
-    event.preventDefault();
-
-    const submitButton = contributionForm.querySelector(
-      'button[type="submit"], input[type="submit"]',
-    );
-
-    if (submitButton) submitButton.disabled = true;
-
-    try {
-      const formData = new FormData(contributionForm);
-
-      const contribution = {
-        memberId: formData.get("memberId"),
-        amount: Number(formData.get("amount")),
-      };
-
-      const response = await fetch("/api/contributions", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(contribution),
-      });
-
-      const result = await readApiResponse(response);
-
-      await loadContributions();
-      contributionForm.reset();
-
-      showMessage(result.message || "Contribution saved successfully.");
-    } catch (error) {
-      console.error("Could not save contribution:", error);
-      showMessage(`Could not save contribution: ${error.message}`);
-    } finally {
-      if (submitButton) submitButton.disabled = false;
-    }
-  });
-}
-
-// -------------------- SUPPORT RECORDS --------------------
-
-function renderSupportRecords() {
-  const list = getElement("support-list");
-
-  if (list) {
-    list.innerHTML = supportRecords.length
-      ? supportRecords
-          .map(
-            (record) => `
-              <tr>
-                <td>${escapeHtml(record.id)}</td>
-                <td>${escapeHtml(record.memberName || record.memberId || "")}</td>
-                <td>${escapeHtml(record.type || record.category || "")}</td>
-                <td>${escapeHtml(record.description || record.note || "")}</td>
-                <td>${escapeHtml(record.status || "")}</td>
-              </tr>
-            `,
-          )
-          .join("")
-      : '<tr><td colspan="5" class="empty">No support records yet.</td></tr>';
-  }
-}
-
-async function loadSupportRecords() {
+async function loadSupport() {
   try {
-    const response = await fetch("/api/support");
-    const data = await readApiResponse(response);
-
-    if (!Array.isArray(data)) {
-      throw new Error("The support API did not return a list.");
-    }
+    const data = await api("/api/support");
+    if (!Array.isArray(data)) throw new Error("Unexpected support response");
 
     supportRecords.splice(0, supportRecords.length, ...data);
-    renderSupportRecords();
-  } catch (error) {
-    console.error("Could not load support records:", error);
-    showMessage(`Could not load support records: ${error.message}`);
-  }
-}
+    const list = $("support-list");
 
-const supportForm = getElement("support-form");
-
-if (supportForm) {
-  supportForm.addEventListener("submit", async (event) => {
-    event.preventDefault();
-
-    const submitButton = supportForm.querySelector(
-      'button[type="submit"], input[type="submit"]',
-    );
-
-    if (submitButton) submitButton.disabled = true;
-
-    try {
-      const formData = new FormData(supportForm);
-
-      const support = {
-        memberId: formData.get("memberId"),
-        type: String(formData.get("type") || "").trim(),
-        description: String(formData.get("description") || "").trim(),
-      };
-
-      const response = await fetch("/api/support", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(support),
-      });
-
-      const result = await readApiResponse(response);
-
-      await loadSupportRecords();
-      supportForm.reset();
-
-      showMessage(result.message || "Support record saved successfully.");
-    } catch (error) {
-      console.error("Could not save support record:", error);
-      showMessage(`Could not save support record: ${error.message}`);
-    } finally {
-      if (submitButton) submitButton.disabled = false;
+    if (list) {
+      list.innerHTML = supportRecords.length
+        ? supportRecords
+            .map(
+              (item) => `
+          <tr>
+            <td>${safe(item.member || item.memberName || item.memberId || "")}</td>
+            <td>${safe(item.type || "")}</td>
+            <td>${safe(item.description || "")}</td>
+            <td>${safe(item.amount ?? "")}</td>
+          </tr>`,
+            )
+            .join("")
+        : '<tr><td colspan="4" class="empty">No support records added yet.</td></tr>';
     }
-  });
-}
 
-// -------------------- INVITATION KEYS --------------------
-
-function renderInvitations() {
-  const list = getElement("invitation-list");
-
-  if (!list) return;
-
-  list.innerHTML = invitations.length
-    ? invitations
-        .map(
-          (invitation) => `
-            <tr>
-              <td>${escapeHtml(invitation.key)}</td>
-              <td>${escapeHtml(invitation.note || invitation.purpose || "")}</td>
-              <td>${escapeHtml(invitation.status)}</td>
-            </tr>
-          `,
-        )
-        .join("")
-    : '<tr><td colspan="3" class="empty">No invitation keys created yet.</td></tr>';
+    setCount("support-count", supportRecords.length);
+  } catch (error) {
+    console.error("Loading support records failed:", error);
+  }
 }
 
 async function loadInvitations() {
   try {
-    const response = await fetch("/api/invitations");
-    const data = await readApiResponse(response);
-
-    if (!Array.isArray(data)) {
-      throw new Error("The invitations API did not return a list.");
-    }
+    const data = await api("/api/invitations");
+    if (!Array.isArray(data))
+      throw new Error("Unexpected invitations response");
 
     invitations.splice(0, invitations.length, ...data);
-    renderInvitations();
+    const list = $("invitation-list");
+
+    if (list) {
+      list.innerHTML = invitations.length
+        ? invitations
+            .map(
+              (item) => `
+          <tr>
+            <td>${safe(item.key || item.invitationKey || "")}</td>
+            <td>${safe(item.note || item.purpose || "")}</td>
+            <td>${safe(item.status || "")}</td>
+          </tr>`,
+            )
+            .join("")
+        : '<tr><td colspan="3" class="empty">No invitation keys available yet.</td></tr>';
+    }
   } catch (error) {
-    console.error("Could not load invitation keys:", error);
-    showMessage(`Could not load invitation keys: ${error.message}`);
+    console.error("Loading invitations failed:", error);
   }
 }
 
-const invitationForm = getElement("invitation-form");
+async function loadSectionData(name) {
+  if (name === "dashboard") await loadDashboard();
+  if (name === "members") await loadMembers();
+  if (name === "tasks") {
+    await loadMembers();
+    await loadTasks();
+  }
+  if (name === "contributions") {
+    await loadMembers();
+    await loadContributions();
+  }
+  if (name === "support") {
+    await loadMembers();
+    await loadSupport();
+  }
+  if (name === "invitations") await loadInvitations();
+}
 
-if (invitationForm) {
-  invitationForm.addEventListener("submit", async (event) => {
+function formDataObject(form) {
+  return Object.fromEntries(new FormData(form).entries());
+}
+
+function bindForm(id, handler) {
+  const form = $(id);
+  if (!form) return;
+
+  form.addEventListener("submit", async (event) => {
     event.preventDefault();
-
-    const submitButton = invitationForm.querySelector(
-      'button[type="submit"], input[type="submit"]',
-    );
-
-    if (submitButton) submitButton.disabled = true;
+    const button = form.querySelector('[type="submit"]');
+    if (button) button.disabled = true;
 
     try {
-      const note =
-        getElement("invitation-note")?.value.trim() || "Cooperative membership";
-
-      const response = await fetch("/api/invitations", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ note }),
-      });
-
-      const result = await readApiResponse(response);
-
-      await loadInvitations();
-      invitationForm.reset();
-
-      showMessage(
-        `Invitation key created successfully!\n\nKey: ${result.key}\nStatus: ${result.status}`,
-      );
+      await handler(formDataObject(form));
+      form.reset();
+      await Promise.all([
+        loadDashboard(),
+        loadMembers(),
+        loadTasks(),
+        loadContributions(),
+        loadSupport(),
+        loadInvitations(),
+      ]);
     } catch (error) {
-      console.error("Could not create invitation key:", error);
-      showMessage(`Could not create invitation key: ${error.message}`);
+      console.error(`${id} submission failed:`, error);
+      notify(`Could not save record: ${error.message}`);
     } finally {
-      if (submitButton) submitButton.disabled = false;
+      if (button) button.disabled = false;
     }
   });
 }
 
-// -------------------- INVITATION KEY VALIDATION --------------------
-
-const validateInvitationForm = getElement("validate-invitation-form");
-
-if (validateInvitationForm) {
-  validateInvitationForm.addEventListener("submit", async (event) => {
-    event.preventDefault();
-
-    const keyInput =
-      getElement("validation-key") ||
-      getElement("invitation-key") ||
-      getElement("invite-key");
-
-    const key = keyInput?.value.trim();
-
-    if (!key) {
-      showMessage("Please enter an invitation key.");
-      return;
-    }
-
-    const submitButton = validateInvitationForm.querySelector(
-      'button[type="submit"], input[type="submit"]',
-    );
-
-    if (submitButton) submitButton.disabled = true;
-
-    try {
-      const response = await fetch("/api/invitations/validate", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ key }),
-      });
-
-      const result = await readApiResponse(response);
-
-      showMessage(
-        result.message ||
-          (result.valid
-            ? "Invitation key is valid."
-            : "Invitation key is invalid."),
-      );
-
-      await loadInvitations();
-    } catch (error) {
-      console.error("Could not validate invitation key:", error);
-      showMessage(`Could not validate invitation key: ${error.message}`);
-    } finally {
-      if (submitButton) submitButton.disabled = false;
-    }
+bindForm("member-form", async (data) => {
+  if (!data.name?.trim() || !data.email?.trim()) {
+    throw new Error("Enter the member's name and email.");
+  }
+  await api("/api/members", {
+    method: "POST",
+    body: JSON.stringify({
+      name: data.name.trim(),
+      email: data.email.trim(),
+    }),
   });
-}
+  notify("Member registered successfully.");
+});
 
-// -------------------- INITIAL SETUP --------------------
+bindForm("task-form", async (data) => {
+  await api("/api/tasks", {
+    method: "POST",
+    body: JSON.stringify({
+      title: data.title,
+      assignee: members.find(member => String(member.id) === String(data.memberId))?.name || "",
+      deadline: data.deadline || "",
+      workDays: Number(data.workDays || 1),
+    }),
+  });
+  notify("Task saved successfully.");
+});
 
-renderMembers();
-renderTasks();
-renderContributions();
-renderSupportRecords();
-renderInvitations();
+bindForm("record-form", async (data) => {
+  await api("/api/contributions", {
+    method: "POST",
+    body: JSON.stringify({
+      member: members.find(member => String(member.id) === String(data.memberId))?.name || "",
+      type: data.type,
+      description: data.description,
+      amount: data.amount || "",
+    }),
+  });
+  notify("Contribution saved successfully.");
+});
 
-if (typeof showSection === "function") {
-  showSection(window.location.hash.slice(1) || "dashboard");
-}
+bindForm("support-form", async (data) => {
+  await api("/api/support", {
+    method: "POST",
+    body: JSON.stringify({
+      member: members.find(member => String(member.id) === String(data.memberId))?.name || "",
+      type: data.type,
+      description: data.description,
+      amount: data.amount || "",
+    }),
+  });
+  notify("Support record saved successfully.");
+});
 
-async function initialiseApp() {
+bindForm("invitation-form", async (data) => {
+  const result = await api("/api/invitations", {
+    method: "POST",
+    body: JSON.stringify({
+      note: data.note || "Cooperative membership",
+    }),
+  });
+  notify(
+    `Invitation created.\nKey: ${result.key || "Check the invitation list"}`,
+  );
+});
+
+document.addEventListener("DOMContentLoaded", async () => {
+  document
+    .querySelectorAll('.navigation a[href^="#"], .quick-link[href^="#"]')
+    .forEach((link) => {
+      link.addEventListener("click", () => {
+        const name = link.getAttribute("href").slice(1);
+        showSection(name);
+      });
+    });
+
+  window.addEventListener("hashchange", navigate);
+  navigate();
+  await loadDashboard();
   await loadMembers();
+  await loadTasks();
+  await loadContributions();
+  await loadSupport();
+  await loadInvitations();
+});
 
-  await Promise.all([
-    loadTasks(),
-    loadContributions(),
-    loadSupportRecords(),
-    loadInvitations(),
-  ]);
-}
 
-initialiseApp();
